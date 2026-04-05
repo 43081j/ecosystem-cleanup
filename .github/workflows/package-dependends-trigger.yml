@@ -1,0 +1,94 @@
+name: Package Dependents Trigger
+
+on:
+  pull_request_target:
+    types: [labeled, opened, reopened, synchronize]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  comment-package-dependents-on-issue:
+    name: Comment package dependents on issue
+    runs-on: ubuntu-latest
+    if: "${{ (github.event.action != 'labeled' || github.event.label.name == 'Trigger: Find Dependents') && github.repository_owner == 'e18e' }}"
+    steps:
+      - name: Get issue title & description
+        id: issue
+        shell: bash
+        run: |
+            content=$(gh issue view ${{ github.event.pull_request.number }} --json title,body)
+            title=$(echo "$content" | jq -r .title)
+            description=$(echo "$content" | jq -r .body)
+            echo "title=$title" >> $GITHUB_OUTPUT
+            echo "description=$description" >> $GITHUB_OUTPUT
+
+      - name: Extract package name from issue title
+        id: package_name
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+            TITLE: ${{ steps.issue.outputs.title }}
+        with:
+            script: |
+                # Extracted title should be in the format of (boundary):
+                # Replace `<package name>`
+                # Replace `<package name>`, `<package name>`, ...
+                # Replace `<package name>` with `<ignored package name>`
+                # Cleanup `<package name>`
+                # Cleanup `<package name>`, `<package name>`, ..`
+                # Remove `<package name>`
+                # Remove `<package name>`, `<package name>`, ...
+                
+                function extractAllPackages(str) {
+                    const packageRegex = /`([@\w/-]+)`/g;
+                    const matches = [];
+                    let match;
+                    
+                    // Only process if it starts with Replace/Cleanup/Remove
+                    if (/^(Replace|Cleanup|Remove)\s+/.test(str)) {
+                        while ((match = packageRegex.exec(str)) !== null) {
+                        matches.push(match[1]);
+                        }
+                        // For "Replace X with Y", only keep the first package(s) before "with"
+                        if (str.includes(' with ')) {
+                        const beforeWith = str.split(' with ')[0];
+                        const beforeWithMatches = [];
+                        packageRegex.lastIndex = 0; // Reset regex
+                        while ((match = packageRegex.exec(beforeWith)) !== null) {
+                            beforeWithMatches.push(match[1]);
+                        }
+                        return beforeWithMatches;
+                        }
+                    }
+                    
+                    return matches;
+                }
+
+                const packages = extractAllPackages(TITLE);
+                if (packages.length === 0) {
+                    core.setFailed(`Could not extract package name from title: ${TITLE}`);
+                    return;
+                }
+                
+                core.setOutput('packages', packages.join(' '));
+      
+      - name: Run Fuzzyma's tool
+        shell: bash
+        run: |
+          output=("<!-- e18e-dependents-marker -->")
+          for package in "${{ steps.package_name.outputs.packages }}"; do
+            echo "Running for $package"
+            output+=("### $package")
+            output+=("$(npx --yes github:Fuzzyma/e18e-tools $package -n 20 -q -o md -U https://npm.devminer.xyz/registry)")
+          done
+
+          # Do we have existing comment that contains the marker?
+          existing_comment=$(gh issue comment ${{ github.event.pull_request.number }} --json body)
+          if echo "$existing_comment" | grep -q "<!-- e18e-dependents-marker -->"; then
+            # Update the existing comment
+            gh issue comment ${{ github.event.pull_request.number }} --body "${output[*]}" --edit-last
+          else
+            # Create a new comment
+            gh issue comment ${{ github.event.pull_request.number }} --body "${output[*]}"
+          fi
